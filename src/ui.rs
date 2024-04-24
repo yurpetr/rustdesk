@@ -259,7 +259,7 @@ impl UI {
     }
 
     fn using_public_server(&self) -> bool {
-        using_public_server()
+        crate::using_public_server()
     }
 
     fn get_options(&self) -> Value {
@@ -323,10 +323,6 @@ impl UI {
         return true;
         #[cfg(debug_assertions)]
         return false;
-    }
-
-    fn is_rdp_service_open(&self) -> bool {
-        is_rdp_service_open()
     }
 
     fn is_share_rdp(&self) -> bool {
@@ -580,8 +576,8 @@ impl UI {
         has_hwcodec()
     }
 
-    fn has_gpucodec(&self) -> bool {
-        has_gpucodec()
+    fn has_vram(&self) -> bool {
+        has_vram()
     }
 
     fn get_langs(&self) -> String {
@@ -625,6 +621,10 @@ impl UI {
         );
         format!("data:image/png;base64,{s}")
     }
+
+    pub fn check_hwcodec(&self) {
+        check_hwcodec()
+    }
 }
 
 impl sciter::EventHandler for UI {
@@ -661,7 +661,6 @@ impl sciter::EventHandler for UI {
         fn is_release();
         fn set_socks(String, String, String);
         fn get_socks();
-        fn is_rdp_service_open();
         fn is_share_rdp();
         fn set_share_rdp(bool);
         fn is_installed_lower_version();
@@ -706,7 +705,7 @@ impl sciter::EventHandler for UI {
         fn get_lan_peers();
         fn get_uuid();
         fn has_hwcodec();
-        fn has_gpucodec();
+        fn has_vram();
         fn get_langs();
         fn default_video_save_directory();
         fn handle_relay_id(String);
@@ -716,6 +715,7 @@ impl sciter::EventHandler for UI {
         fn generate2fa();
         fn generate_2fa_img_src(String);
         fn verify2fa(String);
+        fn check_hwcodec();
     }
 }
 

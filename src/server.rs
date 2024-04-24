@@ -283,6 +283,8 @@ impl Server {
                 s.on_subscribe(conn.clone());
             }
         }
+        #[cfg(target_os = "macos")]
+        self.update_enable_retina();
         self.connections.insert(conn.id(), conn);
         *CONN_COUNT.lock().unwrap() = self.connections.len();
     }
@@ -293,6 +295,8 @@ impl Server {
         }
         self.connections.remove(&conn.id());
         *CONN_COUNT.lock().unwrap() = self.connections.len();
+        #[cfg(target_os = "macos")]
+        self.update_enable_retina();
     }
 
     pub fn close_connections(&mut self) {
@@ -325,6 +329,8 @@ impl Server {
             } else {
                 s.on_unsubscribe(conn.id());
             }
+            #[cfg(target_os = "macos")]
+            self.update_enable_retina();
         }
     }
 
@@ -373,6 +379,17 @@ impl Server {
                 }
             }
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn update_enable_retina(&self) {
+        let mut video_service_count = 0;
+        for (name, service) in self.services.iter() {
+            if Self::is_video_service_name(&name) && service.ok() {
+                video_service_count += 1;
+            }
+        }
+        *scrap::quartz::ENABLE_RETINA.lock().unwrap() = video_service_count < 2;
     }
 }
 
@@ -432,9 +449,8 @@ pub async fn start_server(is_server: bool) {
         log::info!("XAUTHORITY={:?}", std::env::var("XAUTHORITY"));
     }
     #[cfg(feature = "hwcodec")]
-    scrap::hwcodec::hwcodec_new_check_process();
-    #[cfg(feature = "gpucodec")]
-    scrap::gpucodec::gpucodec_new_check_process();
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    scrap::hwcodec::start_check_process(false);
     #[cfg(windows)]
     hbb_common::platform::windows::start_cpu_performance_monitor();
 
@@ -533,12 +549,8 @@ async fn sync_and_watch_config_dir() {
 
     let mut cfg0 = (Config::get(), Config2::get());
     let mut synced = false;
-    let tries =
-        if std::env::args().len() == 2 && std::env::args().nth(1) == Some("--server".to_owned()) {
-            30
-        } else {
-            3
-        };
+    let is_server = std::env::args().nth(1) == Some("--server".to_owned());
+    let tries = if is_server { 30 } else { 3 };
     log::debug!("#tries of ipc service connection: {}", tries);
     use hbb_common::sleep;
     for i in 1..=tries {
@@ -580,7 +592,14 @@ async fn sync_and_watch_config_dir() {
                         match conn.send(&Data::SyncConfig(Some(cfg.clone().into()))).await {
                             Err(e) => {
                                 log::error!("sync config to root failed: {}", e);
-                                break;
+                                match crate::ipc::connect(1000, "_service").await {
+                                    Ok(mut _conn) => {
+                                        conn = _conn;
+                                        log::info!("reconnected to ipc_service");
+                                        break;
+                                    }
+                                    _ => {}
+                                }
                             }
                             _ => {
                                 cfg0 = cfg;

@@ -3,8 +3,9 @@ use hbb_common::password_security;
 use hbb_common::{
     allow_err,
     bytes::Bytes,
-    config::{self, Config, LocalConfig, PeerConfig},
-    config::{CONNECT_TIMEOUT, RENDEZVOUS_PORT},
+    config::{
+        self, Config, LocalConfig, PeerConfig, CONNECT_TIMEOUT, HARD_SETTINGS, RENDEZVOUS_PORT,
+    },
     directories_next,
     futures::future::join_all,
     log,
@@ -130,11 +131,11 @@ pub fn get_license() -> String {
     #[cfg(windows)]
     if let Ok(lic) = crate::platform::windows::get_license_from_exe_name() {
         #[cfg(feature = "flutter")]
-        return format!("Key: {}\nHost: {}\nApi: {}", lic.key, lic.host, lic.api);
+        return format!("Key: {}\nHost: {}\nAPI: {}", lic.key, lic.host, lic.api);
         // default license format is html formed (sciter)
         #[cfg(not(feature = "flutter"))]
         return format!(
-            "<br /> Key: {} <br /> Host: {} Api: {}",
+            "<br /> Key: {} <br /> Host: {} API: {}",
             lic.key, lic.host, lic.api
         );
     }
@@ -169,6 +170,16 @@ pub fn get_option<T: AsRef<str>>(key: T) -> String {
 #[inline]
 pub fn get_local_option(key: String) -> String {
     LocalConfig::get_option(&key)
+}
+
+#[inline]
+pub fn get_hard_option(key: String) -> String {
+    config::HARD_SETTINGS
+        .read()
+        .unwrap()
+        .get(&key)
+        .cloned()
+        .unwrap_or_default()
 }
 
 #[inline]
@@ -246,12 +257,6 @@ pub fn set_peer_option(id: String, name: String, value: String) {
         c.options.insert(name, value);
     }
     c.store(&id);
-}
-
-#[inline]
-pub fn using_public_server() -> bool {
-    option_env!("RENDEZVOUS_SERVER").unwrap_or("").is_empty()
-        && crate::get_custom_rendezvous_server(get_option("custom-rendezvous-server")).is_empty()
 }
 
 #[inline]
@@ -343,7 +348,7 @@ pub fn set_option(key: String, value: String) {
         #[cfg(target_os = "macos")]
         {
             let is_stop = value == "Y";
-            if is_stop && crate::platform::macos::uninstall_service(true) {
+            if is_stop && crate::platform::uninstall_service(true, false) {
                 return;
             }
         }
@@ -351,7 +356,7 @@ pub fn set_option(key: String, value: String) {
         {
             if crate::platform::is_installed() {
                 if value == "Y" {
-                    if crate::platform::uninstall_service(true) {
+                    if crate::platform::uninstall_service(true, false) {
                         return;
                     }
                 } else {
@@ -429,14 +434,6 @@ pub fn is_installed() -> bool {
 #[inline]
 pub fn is_installed() -> bool {
     false
-}
-
-#[inline]
-pub fn is_rdp_service_open() -> bool {
-    #[cfg(windows)]
-    return is_installed() && crate::platform::windows::is_rdp_service_open();
-    #[cfg(not(windows))]
-    return false;
 }
 
 #[inline]
@@ -832,15 +829,14 @@ pub fn get_api_server() -> String {
 
 #[inline]
 pub fn has_hwcodec() -> bool {
-    #[cfg(not(any(feature = "hwcodec", feature = "mediacodec")))]
-    return false;
-    #[cfg(any(feature = "hwcodec", feature = "mediacodec"))]
-    return true;
+    // Has real hardware codec using gpu
+    (cfg!(feature = "hwcodec") && (cfg!(windows) || cfg!(target_os = "linux")))
+        || cfg!(feature = "mediacodec")
 }
 
 #[inline]
-pub fn has_gpucodec() -> bool {
-    cfg!(feature = "gpucodec")
+pub fn has_vram() -> bool {
+    cfg!(feature = "vram")
 }
 
 #[cfg(feature = "flutter")]
@@ -849,14 +845,14 @@ pub fn supported_hwdecodings() -> (bool, bool) {
     let decoding = scrap::codec::Decoder::supported_decodings(None, true, None, &vec![]);
     #[allow(unused_mut)]
     let (mut h264, mut h265) = (decoding.ability_h264 > 0, decoding.ability_h265 > 0);
-    #[cfg(feature = "gpucodec")]
+    #[cfg(feature = "vram")]
     {
         // supported_decodings check runtime luid
-        let gpu = scrap::gpucodec::GpuDecoder::possible_available_without_check();
-        if gpu.0 {
+        let vram = scrap::vram::VRamDecoder::possible_available_without_check();
+        if vram.0 {
             h264 = true;
         }
-        if gpu.1 {
+        if vram.1 {
             h265 = true;
         }
     }
@@ -1044,7 +1040,7 @@ async fn check_connect_status_(reconnect: bool, rx: mpsc::UnboundedReceiver<ipc:
 
     loop {
         if let Ok(mut c) = ipc::connect(1000, "").await {
-            let mut timer = time::interval(time::Duration::from_secs(1));
+            let mut timer = crate::rustdesk_interval(time::interval(time::Duration::from_secs(1)));
             loop {
                 tokio::select! {
                     res = c.next() => {
@@ -1317,4 +1313,15 @@ pub fn verify2fa(code: String) -> bool {
         refresh_options();
     }
     res
+}
+
+pub fn check_hwcodec() {
+    #[cfg(feature = "hwcodec")]
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    {
+        scrap::hwcodec::start_check_process(true);
+        if crate::platform::is_installed() {
+            ipc::notify_server_to_check_hwcodec().ok();
+        }
+    }
 }
