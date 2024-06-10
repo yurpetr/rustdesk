@@ -1,12 +1,12 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     ffi::c_void,
     sync::{Arc, Mutex},
 };
 
 use crate::{
     codec::{base_bitrate, enable_vram_option, EncoderApi, EncoderCfg, Quality},
-    AdapterDevice, CodecFormat, CodecName, EncodeInput, EncodeYuvFormat, Pixfmt,
+    AdapterDevice, CodecFormat, EncodeInput, EncodeYuvFormat, Pixfmt,
 };
 use hbb_common::{
     anyhow::{anyhow, bail, Context},
@@ -16,15 +16,13 @@ use hbb_common::{
     ResultType,
 };
 use hwcodec::{
-    common::{DataFormat, Driver, MAX_GOP},
-    native::{
+    common::{AdapterVendor::*, DataFormat, Driver, MAX_GOP},
+    vram::{
         decode::{self, DecodeFrame, Decoder},
         encode::{self, EncodeFrame, Encoder},
         Available, DecodeContext, DynamicContext, EncodeContext, FeatureContext,
     },
 };
-
-const OUTPUT_SHARED_HANDLE: bool = false;
 
 // https://www.reddit.com/r/buildapc/comments/d2m4ny/two_graphics_cards_two_monitors/
 // https://www.reddit.com/r/techsupport/comments/t2v9u6/dual_monitor_setup_with_dual_gpu/
@@ -32,6 +30,7 @@ const OUTPUT_SHARED_HANDLE: bool = false;
 // https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nf-d3d12-id3d12device-getadapterluid#remarks
 lazy_static::lazy_static! {
     static ref ENOCDE_NOT_USE: Arc<Mutex<HashMap<usize, bool>>> = Default::default();
+    static ref FALLBACK_GDI_DISPLAYS: Arc<Mutex<HashSet<usize>>> = Default::default();
 }
 
 #[derive(Debug, Clone)]
@@ -51,6 +50,7 @@ pub struct VRamEncoder {
     bitrate: u32,
     last_frame_len: usize,
     same_bad_len_counter: usize,
+    config: VRamEncoderConfig,
 }
 
 impl EncoderApi for VRamEncoder {
@@ -86,11 +86,9 @@ impl EncoderApi for VRamEncoder {
                         bitrate,
                         last_frame_len: 0,
                         same_bad_len_counter: 0,
+                        config,
                     }),
-                    Err(_) => {
-                        hbb_common::config::HwCodecConfig::clear_vram();
-                        Err(anyhow!(format!("Failed to create encoder")))
-                    }
+                    Err(_) => Err(anyhow!(format!("Failed to create encoder"))),
                 }
             }
             _ => Err(anyhow!("encoder type mismatch")),
@@ -181,60 +179,86 @@ impl EncoderApi for VRamEncoder {
     }
 
     fn support_abr(&self) -> bool {
-        self.ctx.f.driver != Driver::VPL
+        self.config.device.vendor_id != ADAPTER_VENDOR_INTEL as u32
+    }
+
+    fn support_changing_quality(&self) -> bool {
+        true
+    }
+
+    fn latency_free(&self) -> bool {
+        true
+    }
+
+    fn is_hardware(&self) -> bool {
+        true
     }
 }
 
 impl VRamEncoder {
-    pub fn try_get(device: &AdapterDevice, name: CodecName) -> Option<FeatureContext> {
-        let v: Vec<_> = Self::available(name)
+    pub fn try_get(device: &AdapterDevice, format: CodecFormat) -> Option<FeatureContext> {
+        let v: Vec<_> = Self::available(format)
             .drain(..)
             .filter(|e| e.luid == device.luid)
             .collect();
         if v.len() > 0 {
+            // prefer ffmpeg
+            if let Some(ctx) = v.iter().find(|c| c.driver == Driver::FFMPEG) {
+                return Some(ctx.clone());
+            }
             Some(v[0].clone())
         } else {
             None
         }
     }
 
-    pub fn available(name: CodecName) -> Vec<FeatureContext> {
+    pub fn available(format: CodecFormat) -> Vec<FeatureContext> {
+        let fallbacks = FALLBACK_GDI_DISPLAYS.lock().unwrap().clone();
+        if !fallbacks.is_empty() {
+            log::info!("fallback gdi displays not empty: {fallbacks:?}");
+            return vec![];
+        }
         let not_use = ENOCDE_NOT_USE.lock().unwrap().clone();
         if not_use.values().any(|not_use| *not_use) {
             log::info!("currently not use vram encoders: {not_use:?}");
             return vec![];
         }
-        let data_format = match name {
-            CodecName::H264VRAM => DataFormat::H264,
-            CodecName::H265VRAM => DataFormat::H265,
+        let data_format = match format {
+            CodecFormat::H264 => DataFormat::H264,
+            CodecFormat::H265 => DataFormat::H265,
             _ => return vec![],
         };
-        let Ok(displays) = crate::Display::all() else {
-            log::error!("failed to get displays");
-            return vec![];
-        };
-        if displays.is_empty() {
-            log::error!("no display found");
-            return vec![];
-        }
-        let luids = displays
-            .iter()
-            .map(|d| d.adapter_luid())
-            .collect::<Vec<_>>();
         let v: Vec<_> = get_available_config()
             .map(|c| c.e)
             .unwrap_or_default()
             .drain(..)
             .filter(|c| c.data_format == data_format)
             .collect();
-        if luids
-            .iter()
-            .all(|luid| v.iter().any(|f| Some(f.luid) == *luid))
-        {
+        if crate::hwcodec::HwRamEncoder::try_get(format).is_some() {
+            // has fallback, no need to require all adapters support
             v
         } else {
-            log::info!("not all adapters support {data_format:?}, luids = {luids:?}");
-            vec![]
+            let Ok(displays) = crate::Display::all() else {
+                log::error!("failed to get displays");
+                return vec![];
+            };
+            if displays.is_empty() {
+                log::error!("no display found");
+                return vec![];
+            }
+            let luids = displays
+                .iter()
+                .map(|d| d.adapter_luid())
+                .collect::<Vec<_>>();
+            if luids
+                .iter()
+                .all(|luid| v.iter().any(|f| Some(f.luid) == *luid))
+            {
+                v
+            } else {
+                log::info!("not all adapters support {data_format:?}, luids = {luids:?}");
+                vec![]
+            }
         }
     }
 
@@ -252,21 +276,21 @@ impl VRamEncoder {
     pub fn convert_quality(quality: Quality, f: &FeatureContext) -> u32 {
         match quality {
             Quality::Best => {
-                if f.driver == Driver::VPL && f.data_format == DataFormat::H264 {
+                if f.driver == Driver::MFX && f.data_format == DataFormat::H264 {
                     200
                 } else {
                     150
                 }
             }
             Quality::Balanced => {
-                if f.driver == Driver::VPL && f.data_format == DataFormat::H264 {
+                if f.driver == Driver::MFX && f.data_format == DataFormat::H264 {
                     150
                 } else {
                     100
                 }
             }
             Quality::Low => {
-                if f.driver == Driver::VPL && f.data_format == DataFormat::H264 {
+                if f.driver == Driver::MFX && f.data_format == DataFormat::H264 {
                     75
                 } else {
                     50
@@ -281,8 +305,12 @@ impl VRamEncoder {
         ENOCDE_NOT_USE.lock().unwrap().insert(display, not_use);
     }
 
-    pub fn not_use() -> bool {
-        ENOCDE_NOT_USE.lock().unwrap().iter().any(|v| *v.1)
+    pub fn set_fallback_gdi(display: usize, fallback: bool) {
+        if fallback {
+            FALLBACK_GDI_DISPLAYS.lock().unwrap().insert(display);
+        } else {
+            FALLBACK_GDI_DISPLAYS.lock().unwrap().remove(&display);
+        }
     }
 }
 
@@ -294,6 +322,10 @@ impl VRamDecoder {
     pub fn try_get(format: CodecFormat, luid: Option<i64>) -> Option<DecodeContext> {
         let v: Vec<_> = Self::available(format, luid);
         if v.len() > 0 {
+            // prefer ffmpeg
+            if let Some(ctx) = v.iter().find(|c| c.driver == Driver::FFMPEG) {
+                return Some(ctx.clone());
+            }
             Some(v[0].clone())
         } else {
             None
@@ -327,8 +359,8 @@ impl VRamDecoder {
     }
 
     pub fn new(format: CodecFormat, luid: Option<i64>) -> ResultType<Self> {
-        log::info!("try create {format:?} vram decoder, luid: {luid:?}");
         let ctx = Self::try_get(format, luid).ok_or(anyhow!("Failed to get decode context"))?;
+        log::info!("try create vram decoder: {ctx:?}");
         match Decoder::new(ctx) {
             Ok(decoder) => Ok(Self { decoder }),
             Err(_) => {
@@ -372,7 +404,7 @@ pub(crate) fn check_available_vram() -> String {
         gop: MAX_GOP as _,
     };
     let encoders = encode::available(d);
-    let decoders = decode::available(OUTPUT_SHARED_HANDLE);
+    let decoders = decode::available();
     let available = Available {
         e: encoders,
         d: decoders,

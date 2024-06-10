@@ -1,6 +1,7 @@
 use crate::{
     common::{get_supported_keyboard_modes, is_keyboard_mode_supported},
     input::{MOUSE_BUTTON_LEFT, MOUSE_TYPE_DOWN, MOUSE_TYPE_UP, MOUSE_TYPE_WHEEL},
+    ui_interface::use_texture_render,
 };
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -192,6 +193,11 @@ impl<T: InvokeUiSession> Session<T> {
         self.lc.read().unwrap().conn_type.eq(&ConnType::RDP)
     }
 
+    #[cfg(feature = "flutter")]
+    pub fn is_multi_ui_session(&self) -> bool {
+        self.ui_handler.is_multi_ui_session()
+    }
+
     pub fn get_view_style(&self) -> String {
         self.lc.read().unwrap().view_style.clone()
     }
@@ -228,10 +234,12 @@ impl<T: InvokeUiSession> Session<T> {
         }
     }
 
+    // Caution: This function must be called after peer info is received.
     pub fn get_keyboard_mode(&self) -> String {
         let mode = self.lc.read().unwrap().keyboard_mode.clone();
         let keyboard_mode = KeyboardMode::from_str(&mode);
 
+        // Note: peer_version is 0 before peer info is received.
         let peer_version = self.get_peer_version();
         let platform = self.peer_platform();
 
@@ -305,7 +313,7 @@ impl<T: InvokeUiSession> Session<T> {
     pub fn toggle_option(&self, name: String) {
         let msg = self.lc.write().unwrap().toggle_option(name.clone());
         #[cfg(not(feature = "flutter"))]
-        if name == "enable-file-transfer" {
+        if name == hbb_common::config::keys::OPTION_ENABLE_FILE_COPY_PASTE {
             self.send(Data::ToggleClipboardFile);
         }
         if let Some(msg) = msg {
@@ -441,7 +449,7 @@ impl<T: InvokeUiSession> Session<T> {
         let mark_unsupported = self.lc.read().unwrap().mark_unsupported.clone();
         let decoder = scrap::codec::Decoder::supported_decodings(
             None,
-            cfg!(feature = "flutter"),
+            use_texture_render(),
             luid,
             &mark_unsupported,
         );
@@ -460,6 +468,12 @@ impl<T: InvokeUiSession> Session<T> {
     pub fn change_prefer_codec(&self) {
         let msg = self.lc.write().unwrap().update_supported_decodings();
         self.send(Data::Message(msg));
+    }
+
+    pub fn use_texture_render_changed(&self) {
+        self.send(Data::ResetDecoder(None));
+        self.change_prefer_codec();
+        self.send(Data::Message(LoginConfigHandler::refresh()));
     }
 
     pub fn restart_remote_device(&self) {
@@ -725,8 +739,7 @@ impl<T: InvokeUiSession> Session<T> {
         msg_out.set_misc(misc);
         self.send(Data::Message(msg_out));
 
-        #[cfg(not(feature = "flutter"))]
-        {
+        if !use_texture_render() {
             self.capture_displays(vec![], vec![], vec![display]);
         }
     }
@@ -1378,6 +1391,9 @@ pub trait InvokeUiSession: Send + Sync + Clone + 'static + Sized + Default {
     #[cfg(all(feature = "vram", feature = "flutter"))]
     fn on_texture(&self, display: usize, texture: *mut c_void);
     fn set_multiple_windows_session(&self, sessions: Vec<WindowsSession>);
+    fn set_current_display(&self, disp_idx: i32);
+    #[cfg(feature = "flutter")]
+    fn is_multi_ui_session(&self) -> bool;
 }
 
 impl<T: InvokeUiSession> Deref for Session<T> {

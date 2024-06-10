@@ -1,9 +1,12 @@
 use std::{
     borrow::Cow,
+    collections::HashMap,
     future::Future,
     sync::{Arc, Mutex, RwLock},
     task::Poll,
 };
+
+use serde_json::Value;
 
 #[derive(Debug, Eq, PartialEq)]
 pub enum GrabState {
@@ -123,7 +126,7 @@ use hbb_common::compress::decompress;
 use hbb_common::{
     allow_err,
     anyhow::{anyhow, Context},
-    bail,
+    bail, base64,
     bytes::Bytes,
     compress::compress as compress_func,
     config::{self, Config, CONNECT_TIMEOUT, READ_TIMEOUT},
@@ -145,19 +148,15 @@ use hbb_common::{
 // #[cfg(any(target_os = "android", target_os = "ios", feature = "cli"))]
 use hbb_common::{config::RENDEZVOUS_PORT, futures::future::join_all};
 
-use crate::ui_interface::{get_option, set_option};
+use crate::{
+    hbbs_http::create_http_client_async,
+    ui_interface::{get_option, set_option},
+};
 
 pub type NotifyMessageBox = fn(String, String, String, String) -> dyn Future<Output = ()>;
 
 pub const CLIPBOARD_NAME: &'static str = "clipboard";
 pub const CLIPBOARD_INTERVAL: u64 = 333;
-
-#[cfg(all(target_os = "macos", feature = "flutter_texture_render"))]
-// https://developer.apple.com/forums/thread/712709
-// Memory alignment should be multiple of 64.
-pub const DST_STRIDE_RGBA: usize = 64;
-#[cfg(not(all(target_os = "macos", feature = "flutter_texture_render")))]
-pub const DST_STRIDE_RGBA: usize = 1;
 
 // the executable name of the portable version
 pub const PORTABLE_APPNAME_RUNTIME_ENV_KEY: &str = "RUSTDESK_APPNAME";
@@ -839,18 +838,16 @@ pub fn refresh_rendezvous_server() {
 }
 
 pub fn run_me<T: AsRef<std::ffi::OsStr>>(args: Vec<T>) -> std::io::Result<std::process::Child> {
-    #[cfg(not(feature = "appimage"))]
-    {
-        let cmd = std::env::current_exe()?;
-        return std::process::Command::new(cmd).args(&args).spawn();
-    }
-    #[cfg(feature = "appimage")]
-    {
-        let appdir = std::env::var("APPDIR").map_err(|_| std::io::ErrorKind::Other)?;
+    #[cfg(target_os = "linux")]
+    if let Ok(appdir) = std::env::var("APPDIR") {
         let appimage_cmd = std::path::Path::new(&appdir).join("AppRun");
-        log::info!("path: {:?}", appimage_cmd);
-        return std::process::Command::new(appimage_cmd).args(&args).spawn();
+        if appimage_cmd.exists() {
+            log::info!("path: {:?}", appimage_cmd);
+            return std::process::Command::new(appimage_cmd).args(&args).spawn();
+        }
     }
+    let cmd = std::env::current_exe()?;
+    return std::process::Command::new(cmd).args(&args).spawn();
 }
 
 #[inline]
@@ -972,7 +969,7 @@ pub fn check_software_update() {
 #[tokio::main(flavor = "current_thread")]
 async fn check_software_update_() -> hbb_common::ResultType<()> {
     let url = "https://github.com/rustdesk/rustdesk/releases/latest";
-    let latest_release_response = reqwest::get(url).await?;
+    let latest_release_response = create_http_client_async().get(url).send().await?;
     let latest_release_version = latest_release_response
         .url()
         .path()
@@ -1067,7 +1064,7 @@ pub fn get_audit_server(api: String, custom: String, typ: String) -> String {
 }
 
 pub async fn post_request(url: String, body: String, header: &str) -> ResultType<String> {
-    let mut req = reqwest::Client::new().post(url);
+    let mut req = create_http_client_async().post(url);
     if !header.is_empty() {
         let tmp: Vec<&str> = header.split(": ").collect();
         if tmp.len() == 2 {
@@ -1082,6 +1079,65 @@ pub async fn post_request(url: String, body: String, header: &str) -> ResultType
 #[tokio::main(flavor = "current_thread")]
 pub async fn post_request_sync(url: String, body: String, header: &str) -> ResultType<String> {
     post_request(url, body, header).await
+}
+
+#[tokio::main(flavor = "current_thread")]
+pub async fn http_request_sync(
+    url: String,
+    method: String,
+    body: Option<String>,
+    header: String,
+) -> ResultType<String> {
+    let http_client = create_http_client_async();
+    let mut http_client = match method.as_str() {
+        "get" => http_client.get(url),
+        "post" => http_client.post(url),
+        "put" => http_client.put(url),
+        "delete" => http_client.delete(url),
+        _ => return Err(anyhow!("The HTTP request method is not supported!")),
+    };
+    let v = serde_json::from_str(header.as_str())?;
+
+    if let Value::Object(obj) = v {
+        for (key, value) in obj.iter() {
+            http_client = http_client.header(key, value.as_str().unwrap_or_default());
+        }
+    } else {
+        return Err(anyhow!("HTTP header information parsing failed!"));
+    }
+
+    if let Some(b) = body {
+        http_client = http_client.body(b);
+    }
+
+    let response = http_client
+        .timeout(std::time::Duration::from_secs(12))
+        .send()
+        .await?;
+
+    // Serialize response headers
+    let mut response_headers = serde_json::map::Map::new();
+    for (key, value) in response.headers() {
+        response_headers.insert(
+            key.to_string(),
+            serde_json::json!(value.to_str().unwrap_or("")),
+        );
+    }
+
+    let status_code = response.status().as_u16();
+    let response_body = response.text().await?;
+
+    // Construct the JSON object
+    let mut result = serde_json::map::Map::new();
+    result.insert("status_code".to_string(), serde_json::json!(status_code));
+    result.insert(
+        "headers".to_string(),
+        serde_json::Value::Object(response_headers),
+    );
+    result.insert("body".to_string(), serde_json::json!(response_body));
+
+    // Convert map to JSON string
+    serde_json::to_string(&result).map_err(|e| anyhow!("Failed to serialize response: {}", e))
 }
 
 #[inline]
@@ -1509,6 +1565,74 @@ pub fn load_custom_client() {
     }
 }
 
+fn read_custom_client_advanced_settings(
+    settings: serde_json::Value,
+    map_display_settings: &HashMap<String, &&str>,
+    map_local_settings: &HashMap<String, &&str>,
+    map_settings: &HashMap<String, &&str>,
+    is_override: bool,
+) {
+    let mut display_settings = if is_override {
+        config::OVERWRITE_DISPLAY_SETTINGS.write().unwrap()
+    } else {
+        config::DEFAULT_DISPLAY_SETTINGS.write().unwrap()
+    };
+    let mut local_settings = if is_override {
+        config::OVERWRITE_LOCAL_SETTINGS.write().unwrap()
+    } else {
+        config::DEFAULT_LOCAL_SETTINGS.write().unwrap()
+    };
+    let mut server_settings = if is_override {
+        config::OVERWRITE_SETTINGS.write().unwrap()
+    } else {
+        config::DEFAULT_SETTINGS.write().unwrap()
+    };
+    if let Some(settings) = settings.as_object() {
+        for (k, v) in settings {
+            let Some(v) = v.as_str() else {
+                continue;
+            };
+            if let Some(k2) = map_display_settings.get(k) {
+                display_settings.insert(k2.to_string(), v.to_owned());
+            } else if let Some(k2) = map_local_settings.get(k) {
+                local_settings.insert(k2.to_string(), v.to_owned());
+            } else if let Some(k2) = map_settings.get(k) {
+                server_settings.insert(k2.to_string(), v.to_owned());
+            } else {
+                let k2 = k.replace("_", "-");
+                let k = k2.replace("-", "_");
+                // display
+                display_settings.insert(k.clone(), v.to_owned());
+                display_settings.insert(k2.clone(), v.to_owned());
+                // local
+                local_settings.insert(k.clone(), v.to_owned());
+                local_settings.insert(k2.clone(), v.to_owned());
+                // server
+                server_settings.insert(k.clone(), v.to_owned());
+                server_settings.insert(k2.clone(), v.to_owned());
+            }
+        }
+    }
+}
+
+#[inline]
+#[cfg(target_os = "macos")]
+pub fn get_dst_align_rgba() -> usize {
+    // https://developer.apple.com/forums/thread/712709
+    // Memory alignment should be multiple of 64.
+    if crate::ui_interface::use_texture_render() {
+        64
+    } else {
+        1
+    }
+}
+
+#[inline]
+#[cfg(not(target_os = "macos"))]
+pub fn get_dst_align_rgba() -> usize {
+    1
+}
+
 pub fn read_custom_client(config: &str) {
     let Ok(data) = decode64(config) else {
         log::error!("Failed to decode custom client config");
@@ -1535,55 +1659,36 @@ pub fn read_custom_client(config: &str) {
             *config::APP_NAME.write().unwrap() = app_name.to_owned();
         }
     }
+
+    let mut map_display_settings = HashMap::new();
+    for s in config::keys::KEYS_DISPLAY_SETTINGS {
+        map_display_settings.insert(s.replace("_", "-"), s);
+    }
+    let mut map_local_settings = HashMap::new();
+    for s in config::keys::KEYS_LOCAL_SETTINGS {
+        map_local_settings.insert(s.replace("_", "-"), s);
+    }
+    let mut map_settings = HashMap::new();
+    for s in config::keys::KEYS_SETTINGS {
+        map_settings.insert(s.replace("_", "-"), s);
+    }
     if let Some(default_settings) = data.remove("default-settings") {
-        if let Some(default_settings) = default_settings.as_object() {
-            for (k, v) in default_settings {
-                let Some(v) = v.as_str() else {
-                    continue;
-                };
-                if k.starts_with("$$") {
-                    config::DEFAULT_DISPLAY_SETTINGS
-                        .write()
-                        .unwrap()
-                        .insert(k.clone(), v[2..].to_owned());
-                } else if k.starts_with("$") {
-                    config::DEFAULT_LOCAL_SETTINGS
-                        .write()
-                        .unwrap()
-                        .insert(k.clone(), v[1..].to_owned());
-                } else {
-                    config::DEFAULT_SETTINGS
-                        .write()
-                        .unwrap()
-                        .insert(k.clone(), v.to_owned());
-                }
-            }
-        }
+        read_custom_client_advanced_settings(
+            default_settings,
+            &map_display_settings,
+            &map_local_settings,
+            &map_settings,
+            false,
+        );
     }
     if let Some(overwrite_settings) = data.remove("override-settings") {
-        if let Some(overwrite_settings) = overwrite_settings.as_object() {
-            for (k, v) in overwrite_settings {
-                let Some(v) = v.as_str() else {
-                    continue;
-                };
-                if k.starts_with("$$") {
-                    config::OVERWRITE_DISPLAY_SETTINGS
-                        .write()
-                        .unwrap()
-                        .insert(k.clone(), v[2..].to_owned());
-                } else if k.starts_with("$") {
-                    config::OVERWRITE_LOCAL_SETTINGS
-                        .write()
-                        .unwrap()
-                        .insert(k.clone(), v[1..].to_owned());
-                } else {
-                    config::OVERWRITE_SETTINGS
-                        .write()
-                        .unwrap()
-                        .insert(k.clone(), v.to_owned());
-                }
-            }
-        }
+        read_custom_client_advanced_settings(
+            overwrite_settings,
+            &map_display_settings,
+            &map_local_settings,
+            &map_settings,
+            true,
+        );
     }
     for (k, v) in data {
         if let Some(v) = v.as_str() {
@@ -1593,6 +1698,15 @@ pub fn read_custom_client(config: &str) {
                 .insert(k, v.to_owned());
         };
     }
+}
+
+#[inline]
+pub fn is_empty_uni_link(arg: &str) -> bool {
+    let prefix = crate::get_uri_prefix();
+    if !arg.starts_with(&prefix) {
+        return false;
+    }
+    arg[prefix.len()..].chars().all(|c| c == '/')
 }
 
 #[cfg(test)]
