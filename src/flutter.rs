@@ -44,7 +44,7 @@ pub(crate) const APP_TYPE_CM: &str = "main";
 pub type FlutterSession = Arc<Session<FlutterHandler>>;
 
 lazy_static::lazy_static! {
-    pub(crate) static ref CUR_SESSION_ID: RwLock<SessionID> = Default::default();
+    pub(crate) static ref CUR_SESSION_ID: RwLock<SessionID> = Default::default(); // For desktop only
     static ref GLOBAL_EVENT_STREAM: RwLock<HashMap<String, StreamSink<String>>> = Default::default(); // rust to dart event channel
 }
 
@@ -168,6 +168,9 @@ pub unsafe extern "C" fn get_rustdesk_app_name(buffer: *mut u16, length: i32) ->
 #[derive(Default)]
 struct SessionHandler {
     event_stream: Option<StreamSink<EventToUI>>,
+    // displays of current session.
+    // We need this variable to check if the display is in use before pushing rgba to flutter.
+    displays: Vec<usize>,
     renderer: VideoRenderer,
 }
 
@@ -579,6 +582,7 @@ impl FlutterHandler {
     pub fn update_use_texture_render(&self) {
         self.use_texture_render
             .store(crate::ui_interface::use_texture_render(), Ordering::Relaxed);
+        self.display_rgbas.write().unwrap().clear();
     }
 }
 
@@ -768,9 +772,9 @@ impl InvokeUiSession for FlutterHandler {
     #[inline]
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     fn on_rgba(&self, display: usize, rgba: &mut scrap::ImageRgb) {
-        if self.use_texture_render.load(Ordering::Relaxed) {
-            self.on_rgba_flutter_texture_render(display, rgba);
-        } else {
+        let use_texture_render = self.use_texture_render.load(Ordering::Relaxed);
+        self.on_rgba_flutter_texture_render(use_texture_render, display, rgba);
+        if !use_texture_render {
             self.on_rgba_soft_render(display, rgba);
         }
     }
@@ -790,7 +794,7 @@ impl InvokeUiSession for FlutterHandler {
         for (_, session) in self.session_handlers.read().unwrap().iter() {
             if session.renderer.on_texture(display, texture) {
                 if let Some(stream) = &session.event_stream {
-                    stream.add(EventToUI::Texture(display));
+                    stream.add(EventToUI::Texture(display, true));
                 }
             }
         }
@@ -1039,22 +1043,52 @@ impl FlutterHandler {
         }
         drop(rgba_write_lock);
 
-        // Non-texture-render UI does not support multiple displays in the one UI session.
-        // It's Ok to notify each session for now.
+        let mut is_sent = false;
+        let is_multi_sessions = self.is_multi_ui_session();
         for h in self.session_handlers.read().unwrap().values() {
+            // The soft renderer does not support multi-displays session for now.
+            if h.displays.len() > 1 {
+                continue;
+            }
+            // If there're multiple ui sessions, we only notify the ui session that has the display.
+            if is_multi_sessions {
+                if !h.displays.contains(&display) {
+                    continue;
+                }
+            }
             if let Some(stream) = &h.event_stream {
                 stream.add(EventToUI::Rgba(display));
+                is_sent = true;
+            }
+        }
+        // We need `is_sent` here. Because we use texture render for multi-displays session.
+        //
+        // Eg. We have two windows, one is display 1, the other is displays 0&1.
+        // When image of display 0 is received, we will not send the event.
+        //
+        // 1. "display 1" will not send the event.
+        // 2. "displays 0&1" will not send the event. Because it uses texutre render for now.
+        if !is_sent {
+            if let Some(rgba_data) = self.display_rgbas.write().unwrap().get_mut(&display) {
+                rgba_data.valid = false;
             }
         }
     }
 
     #[inline]
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
-    fn on_rgba_flutter_texture_render(&self, display: usize, rgba: &mut scrap::ImageRgb) {
+    fn on_rgba_flutter_texture_render(
+        &self,
+        use_texture_render: bool,
+        display: usize,
+        rgba: &mut scrap::ImageRgb,
+    ) {
         for (_, session) in self.session_handlers.read().unwrap().iter() {
-            if session.renderer.on_rgba(display, rgba) {
-                if let Some(stream) = &session.event_stream {
-                    stream.add(EventToUI::Rgba(display));
+            if use_texture_render || session.displays.len() > 1 {
+                if session.renderer.on_rgba(display, rgba) {
+                    if let Some(stream) = &session.event_stream {
+                        stream.add(EventToUI::Texture(display, false));
+                    }
                 }
             }
         }
@@ -1062,8 +1096,12 @@ impl FlutterHandler {
 }
 
 // This function is only used for the default connection session.
-pub fn session_add_existed(peer_id: String, session_id: SessionID) -> ResultType<()> {
-    sessions::insert_peer_session_id(peer_id, ConnType::DEFAULT_CONN, session_id);
+pub fn session_add_existed(
+    peer_id: String,
+    session_id: SessionID,
+    displays: Vec<i32>,
+) -> ResultType<()> {
+    sessions::insert_peer_session_id(peer_id, ConnType::DEFAULT_CONN, session_id, displays);
     Ok(())
 }
 
@@ -1218,6 +1256,19 @@ pub fn update_text_clipboard_required() {
 pub fn send_text_clipboard_msg(msg: Message) {
     for s in sessions::get_sessions() {
         if s.is_text_clipboard_required() {
+            // Check if the client supports multi clipboards
+            if let Some(message::Union::MultiClipboards(multi_clipboards)) = &msg.union {
+                let version = s.ui_handler.peer_info.read().unwrap().version.clone();
+                let platform = s.ui_handler.peer_info.read().unwrap().platform.clone();
+                if let Some(msg_out) = crate::clipboard::get_msg_if_not_support_multi_clip(
+                    &version,
+                    &platform,
+                    multi_clipboards,
+                ) {
+                    s.send(Data::Message(msg_out));
+                    continue;
+                }
+            }
             s.send(Data::Message(msg.clone()));
         }
     }
@@ -1483,6 +1534,11 @@ pub fn session_set_size(session_id: SessionID, display: usize, width: usize, hei
             .unwrap()
             .get_mut(&session_id)
         {
+            // If the session is the first connection, displays is not set yet.
+            // `displays`` is set while switching displays or adding a new session.
+            if !h.displays.contains(&display) {
+                h.displays.push(display);
+            }
             h.renderer.set_size(display, width, height);
             break;
         }
@@ -1724,6 +1780,54 @@ pub fn try_sync_peer_option(
     }
 }
 
+pub(super) fn session_update_virtual_display(session: &FlutterSession, index: i32, on: bool) {
+    let virtual_display_key = "virtual-display";
+    let displays = session.get_option(virtual_display_key.to_owned());
+    if !on {
+        if index == -1 {
+            if !displays.is_empty() {
+                session.set_option(virtual_display_key.to_owned(), "".to_owned());
+            }
+        } else {
+            let mut vdisplays = displays.split(',').collect::<Vec<_>>();
+            let len = vdisplays.len();
+            if index == 0 {
+                // 0 means we cann't toggle the virtual display by index.
+                vdisplays.remove(vdisplays.len() - 1);
+            } else {
+                if let Some(i) = vdisplays.iter().position(|&x| x == index.to_string()) {
+                    vdisplays.remove(i);
+                }
+            }
+            if vdisplays.len() != len {
+                session.set_option(
+                    virtual_display_key.to_owned(),
+                    vdisplays.join(",").to_owned(),
+                );
+            }
+        }
+    } else {
+        let mut vdisplays = displays
+            .split(',')
+            .map(|x| x.to_string())
+            .collect::<Vec<_>>();
+        let len = vdisplays.len();
+        if index == 0 {
+            vdisplays.push(index.to_string());
+        } else {
+            if !vdisplays.iter().any(|x| *x == index.to_string()) {
+                vdisplays.push(index.to_string());
+            }
+        }
+        if vdisplays.len() != len {
+            session.set_option(
+                virtual_display_key.to_owned(),
+                vdisplays.join(",").to_owned(),
+            );
+        }
+    }
+}
+
 // sessions mod is used to avoid the big lock of sessions' map.
 pub mod sessions {
     use std::collections::HashSet;
@@ -1843,8 +1947,11 @@ pub mod sessions {
 
     pub fn session_switch_display(is_desktop: bool, session_id: SessionID, value: Vec<i32>) {
         for s in SESSIONS.read().unwrap().values() {
-            let read_lock = s.ui_handler.session_handlers.read().unwrap();
-            if read_lock.contains_key(&session_id) {
+            let mut write_lock = s.ui_handler.session_handlers.write().unwrap();
+            if let Some(h) = write_lock.get_mut(&session_id) {
+                h.displays = value.iter().map(|x| *x as usize).collect::<_>();
+                #[cfg(not(any(target_os = "android", target_os = "ios")))]
+                let displays_refresh = value.clone();
                 if value.len() == 1 {
                     // Switch display.
                     // This operation will also cause the peer to send a switch display message.
@@ -1860,13 +1967,30 @@ pub mod sessions {
                                 Some(value[0] as _),
                                 &session_id,
                                 &s,
-                                &read_lock,
+                                &write_lock,
                             );
                         }
                     }
                 } else {
                     // Try capture all displays.
                     s.capture_displays(vec![], vec![], value);
+                }
+                // When switching display, we also need to send "Refresh display" message.
+                // On the controlled side:
+                // 1. If this display is not currently captured -> Refresh -> Message "Refresh display" is not required.
+                // One more key frame (first frame) will be sent because the refresh message.
+                // 2. If this display is currently captured -> Not refresh -> Message "Refresh display" is required.
+                // Without the message, the control side cannot see the latest display image.
+                #[cfg(not(any(target_os = "android", target_os = "ios")))]
+                {
+                    let is_support_multi_ui_session = crate::common::is_support_multi_ui_session(
+                        &s.ui_handler.peer_info.read().unwrap().version,
+                    );
+                    if is_support_multi_ui_session {
+                        for display in displays_refresh.iter() {
+                            s.refresh_video(*display);
+                        }
+                    }
                 }
                 break;
             }
@@ -1892,9 +2016,11 @@ pub mod sessions {
         peer_id: String,
         conn_type: ConnType,
         session_id: SessionID,
+        displays: Vec<i32>,
     ) -> bool {
         if let Some(s) = SESSIONS.read().unwrap().get(&(peer_id, conn_type)) {
             let mut h = SessionHandler::default();
+            h.displays = displays.iter().map(|x| *x as usize).collect::<_>();
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
             let is_support_multi_ui_session = crate::common::is_support_multi_ui_session(
                 &s.ui_handler.peer_info.read().unwrap().version,

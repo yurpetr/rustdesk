@@ -4,6 +4,7 @@ import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter_hbb/consts.dart';
 import 'package:flutter_hbb/main.dart';
+import 'package:flutter_hbb/mobile/pages/settings_page.dart';
 import 'package:flutter_hbb/models/chat_model.dart';
 import 'package:flutter_hbb/models/platform_model.dart';
 import 'package:get/get.dart';
@@ -176,6 +177,11 @@ class ServerModel with ChangeNotifier {
         await timerCallback();
       });
     }
+
+    // Initial keyboard status is off on mobile
+    if (isMobile) {
+      bind.mainSetOption(key: kOptionEnableKeyboard, value: 'N');
+    }
   }
 
   /// 1. check android permission
@@ -190,7 +196,7 @@ class ServerModel with ChangeNotifier {
       bind.mainSetOption(key: kOptionEnableAudio, value: "N");
     } else {
       final audioOption = await bind.mainGetOption(key: kOptionEnableAudio);
-      _audioOk = audioOption.isEmpty;
+      _audioOk = audioOption != 'N';
     }
 
     // file
@@ -200,7 +206,7 @@ class ServerModel with ChangeNotifier {
     } else {
       final fileOption =
           await bind.mainGetOption(key: kOptionEnableFileTransfer);
-      _fileOk = fileOption.isEmpty;
+      _fileOk = fileOption != 'N';
     }
 
     notifyListeners();
@@ -421,7 +427,7 @@ class ServerModel with ChangeNotifier {
     await bind.mainStartService();
     updateClientState();
     if (isAndroid) {
-      WakelockPlus.enable();
+      androidUpdatekeepScreenOn();
     }
   }
 
@@ -514,6 +520,7 @@ class ServerModel with ChangeNotifier {
     }
     if (_clients.length != oldClientLenght) {
       notifyListeners();
+      if (isAndroid) androidUpdatekeepScreenOn();
     }
   }
 
@@ -548,6 +555,7 @@ class ServerModel with ChangeNotifier {
       scrollToBottom();
       notifyListeners();
       if (isAndroid && !client.authorized) showLoginDialog(client);
+      if (isAndroid) androidUpdatekeepScreenOn();
     } catch (e) {
       debugPrint("Failed to call loginRequest,error:$e");
     }
@@ -668,6 +676,7 @@ class ServerModel with ChangeNotifier {
       final index = _clients.indexOf(client);
       tabController.remove(index);
       _clients.remove(client);
+      if (isAndroid) androidUpdatekeepScreenOn();
     }
   }
 
@@ -691,6 +700,7 @@ class ServerModel with ChangeNotifier {
       if (desktopType == DesktopType.cm && _clients.isEmpty) {
         hideCmWindow();
       }
+      if (isAndroid) androidUpdatekeepScreenOn();
       notifyListeners();
     } catch (e) {
       debugPrint("onClientRemove failed,error:$e");
@@ -702,6 +712,7 @@ class ServerModel with ChangeNotifier {
         _clients.map((client) => bind.cmCloseConnection(connId: client.id)));
     _clients.clear();
     tabController.state.value.tabs.clear();
+    if (isAndroid) androidUpdatekeepScreenOn();
   }
 
   void jumpTo(int id) {
@@ -737,6 +748,27 @@ class ServerModel with ChangeNotifier {
       }
     } catch (e) {
       debugPrint("updateVoiceCallState failed: $e");
+    }
+  }
+
+  void androidUpdatekeepScreenOn() async {
+    if (!isAndroid) return;
+    var floatingWindowDisabled =
+        bind.mainGetLocalOption(key: kOptionDisableFloatingWindow) == "Y" ||
+            !await AndroidPermissionManager.check(kSystemAlertWindow);
+    final keepScreenOn = floatingWindowDisabled
+        ? KeepScreenOn.never
+        : optionToKeepScreenOn(
+            bind.mainGetLocalOption(key: kOptionKeepScreenOn));
+    final on = ((keepScreenOn == KeepScreenOn.serviceOn) && _isStart) ||
+        (keepScreenOn == KeepScreenOn.duringControlled &&
+            _clients.map((e) => !e.disconnected).isNotEmpty);
+    if (on != await WakelockPlus.enabled) {
+      if (on) {
+        WakelockPlus.enable();
+      } else {
+        WakelockPlus.disable();
+      }
     }
   }
 }
