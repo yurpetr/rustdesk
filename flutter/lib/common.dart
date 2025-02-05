@@ -3610,7 +3610,7 @@ void earlyAssert() {
 }
 
 void checkUpdate() {
-  if (isDesktop || isAndroid) {
+  if (!isWeb) {
     if (!bind.isCustomClient()) {
       platformFFI.registerEventHandler(
           kCheckSoftwareUpdateFinish, kCheckSoftwareUpdateFinish,
@@ -3622,6 +3622,19 @@ void checkUpdate() {
       Timer(const Duration(seconds: 1), () async {
         bind.mainGetSoftwareUpdateUrl();
       });
+    }
+  }
+}
+
+// https://github.com/flutter/flutter/issues/153560#issuecomment-2497160535
+// For TextField, TextFormField
+extension WorkaroundFreezeLinuxMint on Widget {
+  Widget workaroundFreezeLinuxMint() {
+    // No need to check if is Linux Mint, because this workaround is harmless on other platforms.
+    if (isLinux) {
+      return ExcludeSemantics(child: this);
+    } else {
+      return this;
     }
   }
 }
