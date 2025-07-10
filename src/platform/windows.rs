@@ -41,7 +41,9 @@ use winapi::{
     um::{
         errhandlingapi::GetLastError,
         handleapi::CloseHandle,
-        libloaderapi::{GetProcAddress, LoadLibraryExA, LOAD_LIBRARY_SEARCH_SYSTEM32},
+        libloaderapi::{
+            GetProcAddress, LoadLibraryA, LoadLibraryExA, LOAD_LIBRARY_SEARCH_SYSTEM32,
+        },
         minwinbase::STILL_ACTIVE,
         processthreadsapi::{
             GetCurrentProcess, GetCurrentProcessId, GetExitCodeProcess, OpenProcess,
@@ -784,7 +786,79 @@ pub fn send_sas() {
     }
     unsafe {
         log::info!("SAS received");
+
+        // Check and temporarily set SoftwareSASGeneration if needed
+        let mut original_value: Option<u32> = None;
+        let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
+
+        if let Ok(policy_key) = hklm.open_subkey_with_flags(
+            "Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\System",
+            KEY_READ | KEY_WRITE,
+        ) {
+            // Read current value
+            match policy_key.get_value::<u32, _>("SoftwareSASGeneration") {
+                Ok(value) => {
+                    /*
+                    - 0 = None (disabled)
+                    - 1 = Services
+                    - 2 = Ease of Access applications
+                    - 3 = Services and Ease of Access applications (Both)
+                                      */
+                    if value != 1 && value != 3 {
+                        original_value = Some(value);
+                        log::info!("SoftwareSASGeneration is {}, setting to 1", value);
+                        // Set to 1 for SendSAS to work
+                        if let Err(e) = policy_key.set_value("SoftwareSASGeneration", &1u32) {
+                            log::error!("Failed to set SoftwareSASGeneration: {}", e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    log::info!(
+                        "SoftwareSASGeneration not found or error reading: {}, setting to 1",
+                        e
+                    );
+                    original_value = Some(0); // Mark that we need to restore (delete) it
+                                              // Create and set to 1
+                    if let Err(e) = policy_key.set_value("SoftwareSASGeneration", &1u32) {
+                        log::error!("Failed to set SoftwareSASGeneration: {}", e);
+                    }
+                }
+            }
+        } else {
+            log::error!("Failed to open registry key for SoftwareSASGeneration");
+        }
+
+        // Send SAS
         SendSAS(FALSE);
+
+        // Restore original value if we changed it
+        if let Some(original) = original_value {
+            if let Ok(policy_key) = hklm.open_subkey_with_flags(
+                "Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\System",
+                KEY_WRITE,
+            ) {
+                if original == 0 {
+                    // It didn't exist before, delete it
+                    if let Err(e) = policy_key.delete_value("SoftwareSASGeneration") {
+                        log::error!("Failed to delete SoftwareSASGeneration: {}", e);
+                    } else {
+                        log::info!("Deleted SoftwareSASGeneration (restored to original state)");
+                    }
+                } else {
+                    // Restore the original value
+                    if let Err(e) = policy_key.set_value("SoftwareSASGeneration", &original) {
+                        log::error!(
+                            "Failed to restore SoftwareSASGeneration to {}: {}",
+                            original,
+                            e
+                        );
+                    } else {
+                        log::info!("Restored SoftwareSASGeneration to {}", original);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -1217,7 +1291,7 @@ fn get_after_install(
     // reg delete HKEY_CURRENT_USER\Software\Classes for
     // https://github.com/rustdesk/rustdesk/commit/f4bdfb6936ae4804fc8ab1cf560db192622ad01a
     // and https://github.com/leanflutter/uni_links_desktop/blob/1b72b0226cec9943ca8a84e244c149773f384e46/lib/src/protocol_registrar_impl_windows.dart#L30
-    let hcu = winreg::RegKey::predef(HKEY_CURRENT_USER);
+    let hcu = RegKey::predef(HKEY_CURRENT_USER);
     hcu.delete_subkey_all(format!("Software\\Classes\\{}", exe))
         .ok();
 
@@ -1351,7 +1425,7 @@ copy /Y \"{tmp_path}\\Uninstall {app_name}.lnk\" \"{start_menu}\\\"
         );
         reg_value_start_menu_shortcuts = "1".to_owned();
     }
-    let install_printer = options.contains("printer") && crate::platform::is_win_10_or_greater();
+    let install_printer = options.contains("printer") && is_win_10_or_greater();
     if install_printer {
         reg_value_printer = "1".to_owned();
     }
@@ -1394,7 +1468,7 @@ copy /Y \"{tmp_path}\\{app_name} Tray.lnk\" \"%PROGRAMDATA%\\Microsoft\\Windows\
         // No need to use `|| true` here.
         // The script will not exit even if `--install-remote-printer` panics.
         format!("\"{}\" --install-remote-printer", &src_exe)
-    } else if crate::platform::is_win_10_or_greater() {
+    } else if is_win_10_or_greater() {
         format!("\"{}\" --uninstall-remote-printer", &src_exe)
     } else {
         "".to_owned()
@@ -1715,7 +1789,12 @@ pub fn bootstrap() -> bool {
     #[cfg(not(debug_assertions))]
     {
         // This function will cause `'sciter.dll' was not found neither in PATH nor near the current executable.` when debugging RustDesk.
-        set_safe_load_dll()
+        // Only call set_safe_load_dll() on Windows 10 or greater
+        if is_win_10_or_greater() {
+            set_safe_load_dll()
+        } else {
+            true
+        }
     }
 }
 
@@ -2896,11 +2975,15 @@ pub fn try_kill_rustdesk_main_window_process() -> ResultType<()> {
 fn nt_terminate_process(process_id: DWORD) -> ResultType<()> {
     type NtTerminateProcess = unsafe extern "system" fn(HANDLE, DWORD) -> DWORD;
     unsafe {
-        let h_module = LoadLibraryExA(
-            CString::new("ntdll.dll")?.as_ptr(),
-            std::ptr::null_mut(),
-            LOAD_LIBRARY_SEARCH_SYSTEM32,
-        );
+        let h_module = if is_win_10_or_greater() {
+            LoadLibraryExA(
+                CString::new("ntdll.dll")?.as_ptr(),
+                std::ptr::null_mut(),
+                LOAD_LIBRARY_SEARCH_SYSTEM32,
+            )
+        } else {
+            LoadLibraryA(CString::new("ntdll.dll")?.as_ptr())
+        };
         if !h_module.is_null() {
             let f_nt_terminate_process: NtTerminateProcess = std::mem::transmute(GetProcAddress(
                 h_module,
@@ -3001,16 +3084,21 @@ pub mod reg_display_settings {
         None
     }
 
-    pub fn restore_reg_connectivity(reg_recovery: RegRecovery) -> ResultType<()> {
+    pub fn restore_reg_connectivity(reg_recovery: RegRecovery, force: bool) -> ResultType<()> {
         let hklm = winreg::RegKey::predef(HKEY_LOCAL_MACHINE);
         let reg_item = hklm.open_subkey_with_flags(&reg_recovery.path, KEY_READ | KEY_WRITE)?;
-        let cur_reg_value = reg_item.get_raw_value(&reg_recovery.key)?;
-        let new_reg_value = RegValue {
-            bytes: reg_recovery.new.0,
-            vtype: isize_to_reg_type(reg_recovery.new.1),
-        };
-        if cur_reg_value != new_reg_value {
-            return Ok(());
+        if !force {
+            let cur_reg_value = reg_item.get_raw_value(&reg_recovery.key)?;
+            let new_reg_value = RegValue {
+                bytes: reg_recovery.new.0,
+                vtype: isize_to_reg_type(reg_recovery.new.1),
+            };
+            // Compare if the current value is the same as the new value.
+            // If they are not the same, the registry value has been changed by other processes.
+            // So we do not restore the registry value.
+            if cur_reg_value != new_reg_value {
+                return Ok(());
+            }
         }
         let reg_value = RegValue {
             bytes: reg_recovery.old.0,
